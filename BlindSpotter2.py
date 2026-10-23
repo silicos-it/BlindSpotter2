@@ -139,7 +139,8 @@ def ExpandFileArgument(path):
 def ParseCommandline():
 
 	parser = argparse.ArgumentParser(description="Identify preferred ligand binding hotspots from a LiGaMD trajectory "
-												   "via spatial clustering of the ligand and LiGaMD cumulant-expansion PMF reweighting.")
+												   "via spatial clustering of the ligand and LiGaMD cumulant-expansion PMF reweighting.",
+									  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
 	parser.add_argument("-v",
 						"--version",
@@ -151,7 +152,8 @@ def ParseCommandline():
 						"--parm",
 						type=str,
 						help="AMBER parameter/topology file",
-						required=True)
+						required=True,
+						default=argparse.SUPPRESS)
 
 	parser.add_argument("-t",
 						"--trajectory",
@@ -160,7 +162,8 @@ def ParseCommandline():
 							 "trajectory files, one per line ('#'-prefixed lines are comments) - e.g. "
 							 "to combine multiple independent LiGaMD runs into one combined analysis. "
 							 "Must list the same number of files, in the same order, as --boost.",
-						required=True)
+						required=True,
+						default=argparse.SUPPRESS)
 
 	parser.add_argument("-b",
 						"--boost",
@@ -168,7 +171,8 @@ def ParseCommandline():
 						help="LiGaMD boost potential log file (gamd.log), or a plain-text file listing "
 							 "several boost log files (same one-per-line convention as --trajectory), "
 							 "paired in order with the files listed under --trajectory",
-						required=True)
+						required=True,
+						default=argparse.SUPPRESS)
 
 	parser.add_argument("--ligand",
 						type=str,
@@ -176,12 +180,14 @@ def ParseCommandline():
 							 "Note: a purely-numeric mask token (e.g. ':892') is always parsed by cpptraj "
 							 "as a residue NUMBER, never as a residue NAME, even if the residue's actual "
 							 "name happens to be the string '892' - use the residue's number in that case.",
-						required=True)
+						required=True,
+						default=argparse.SUPPRESS)
 
 	parser.add_argument("--protein",
 						type=str,
 						help="cpptraj atom mask selecting the protein, e.g. ':1-282'",
-						required=True)
+						required=True,
+						default=argparse.SUPPRESS)
 
 	parser.add_argument("-o",
 						"--output",
@@ -221,7 +227,7 @@ def ParseCommandline():
 						dest="dv_columns",
 						type=str,
 						help="comma-separated 0-based field indices in the boost log that are summed "
-							 "into the total boost potential per frame (default '6,7' sums the LiGaMD "
+							 "into the total boost potential per frame (the default sums the LiGaMD "
 							 "total-potential and dihedral boost columns for a dual-boost run)",
 						required=False,
 						default="6,7")
