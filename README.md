@@ -1,4 +1,7 @@
 # BindSpotter
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 BindSpotter triangulates the ligand’s hotspot by turning residue-wise distance preferences into intersecting geometric constraints, yielding a precise location for the binding site.
 
 ## BindSpotter: From PMF to Binding Hotspot
