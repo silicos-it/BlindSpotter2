@@ -2,6 +2,13 @@
 __pycache__/
 *.pyc
 
+# Local Claude Code instructions (not tracked in git)
+CLAUDE.md
+
+# Design brief and reference docs (not tracked in git)
+PROMPT
+ExternalDocumentation/
+
 # Large test data / simulation outputs (not suitable for git).
 # TestSystems/1T49/ alone is ~55GB (trajectory NPT_prod.nc is ~52GB, gamd.log
 # is ~148MB) - far beyond what git/GitHub can reasonably store. Keep these

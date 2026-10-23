@@ -63,6 +63,76 @@ def FindCpptraj():
 
 
 
+# Detect whether a file is a plain list of file paths (one per line) rather than
+# the data file itself
+# ###################################################################################
+#
+# A listing line is a bare path with no internal whitespace; a real trajectory
+# (binary NetCDF, or whitespace-separated columns in a formatted/ASCII trajectory)
+# or boost log (whitespace-separated numeric columns) line never satisfies that, so
+# this safely tells the two apart without relying on file extensions.
+
+def IsListFile(path):
+
+	try:
+		with open(path, "r") as f:
+			LINES = f.readlines()
+	except (OSError, UnicodeDecodeError):
+		return False
+
+	sawEntry = False
+	for LINE in LINES:
+		LINE = LINE.strip()
+		if LINE == "" or LINE.startswith("#"):
+			continue
+		if len(LINE.split()) != 1:
+			return False
+		sawEntry = True
+
+	return sawEntry
+
+
+
+# Read the file paths listed in a list file ('#'-prefixed lines are comments)
+# ##################################################################################
+#
+# A relative entry is resolved against the current directory first, then against
+# the list file's own directory, so lists can be written either cwd-relative or
+# self-contained next to the files they reference.
+
+def ReadFileList(path):
+
+	baseDir = os.path.dirname(os.path.abspath(path))
+	entries = []
+	with open(path, "r") as f:
+		for LINE in f:
+			LINE = LINE.strip()
+			if LINE == "" or LINE.startswith("#"):
+				continue
+			entries.append(LINE)
+
+	resolved = []
+	for entry in entries:
+		if os.path.isfile(entry):
+			resolved.append(entry)
+		else:
+			resolved.append(os.path.join(baseDir, entry))
+
+	return resolved
+
+
+
+# Expand a -t/--trajectory or -b/--boost argument into one or more file paths
+# ################################################################################
+
+def ExpandFileArgument(path):
+
+	if IsListFile(path):
+		return ReadFileList(path)
+	return [path]
+
+
+
 # Parse command-line arguments
 # #############################
 
@@ -86,13 +156,18 @@ def ParseCommandline():
 	parser.add_argument("-t",
 						"--trajectory",
 						type=str,
-						help="MD trajectory file (e.g. NetCDF)",
+						help="MD trajectory file (e.g. NetCDF), or a plain-text file listing several "
+							 "trajectory files, one per line ('#'-prefixed lines are comments) - e.g. "
+							 "to combine multiple independent LiGaMD runs into one combined analysis. "
+							 "Must list the same number of files, in the same order, as --boost.",
 						required=True)
 
 	parser.add_argument("-b",
 						"--boost",
 						type=str,
-						help="LiGaMD boost potential log file (gamd.log)",
+						help="LiGaMD boost potential log file (gamd.log), or a plain-text file listing "
+							 "several boost log files (same one-per-line convention as --trajectory), "
+							 "paired in order with the files listed under --trajectory",
 						required=True)
 
 	parser.add_argument("--ligand",
@@ -201,6 +276,25 @@ def ParseCommandline():
 		if not os.path.isfile(PATH):
 			print("The %s file %s is errorneous - quitting with error code 1" % (LABEL, PATH))
 			sys.exit(1)
+
+	# -t/--trajectory and -b/--boost may each be a single file or a list file -
+	# expand to the concrete file(s) to process, and check those exist too
+	args.trajectory_files = ExpandFileArgument(args.trajectory)
+	args.boost_files = ExpandFileArgument(args.boost)
+
+	for (LABEL, SOURCE, PATHS) in (("trajectory", args.trajectory, args.trajectory_files),
+									("boost", args.boost, args.boost_files)):
+		for PATH in PATHS:
+			if not os.path.isfile(PATH):
+				print("Can not find the %s file %s (listed in %s) - quitting with error code 1" %
+					  (LABEL, PATH, SOURCE))
+				sys.exit(1)
+
+	if len(args.trajectory_files) != len(args.boost_files):
+		print("The number of trajectory files (%d) must match the number of boost files (%d) - "
+			  "each trajectory is paired with its own boost log, in the same order - "
+			  "quitting with error code 1" % (len(args.trajectory_files), len(args.boost_files)))
+		sys.exit(1)
 
 	# Numeric bounds
 	if args.minpoints < 2:
@@ -336,12 +430,13 @@ def RunCpptraj(cpptrajExe, scriptPath):
 # Write the main cpptraj analysis script (strip, align, ligand COM, cluster)
 # ############################################################################
 
-def WriteMainCpptrajScript(scriptPath, parmFile, trajFile, stride, stripMask, proteinMask, ligandMask,
+def WriteMainCpptrajScript(scriptPath, parmFile, trajFiles, stride, stripMask, proteinMask, ligandMask,
 							minpoints, epsilon, comFile, cnumFile, summaryFile, infoFile):
 
 	f = open(scriptPath, "w")
 	f.write("parm %s\n" % (parmFile))
-	f.write("trajin %s 1 last %d\n" % (trajFile, stride))
+	for trajFile in trajFiles:
+		f.write("trajin %s 1 last %d\n" % (trajFile, stride))
 	if stripMask is not None:
 		f.write("%s\n" % (stripMask))
 	f.write("autoimage\n")
@@ -619,15 +714,22 @@ if __name__ == "__main__":
 	else:
 		print("Detected solvent/ion residues to strip: %s" % (stripMask))
 
+	# Runs to process
+	# ################
+
+	print("Processing %d run(s):" % (len(args.trajectory_files)))
+	for i, (trajFile, boostFile) in enumerate(zip(args.trajectory_files, args.boost_files), start=1):
+		print("  [%d] trajectory=%s  boost=%s" % (i, trajFile, boostFile))
+
 	# Frame stride
 	# ############
 
-	nFramesTotal = CountBoostLogFrames(args.boost)
+	nFramesTotal = sum(CountBoostLogFrames(b) for b in args.boost_files)
 	if args.stride > 0:
 		stride = args.stride
 	else:
 		stride = max(1, int(math.ceil(nFramesTotal / float(args.max_cluster_frames))))
-	print("Boost log reports %d frames; using stride %d (~%d frames to be processed)" %
+	print("Boost log(s) report %d frames total; using stride %d (~%d frames to be processed)" %
 		  (nFramesTotal, stride, (nFramesTotal + stride - 1) // stride))
 
 	# Main cpptraj analysis: strip, align, ligand COM, cluster
@@ -639,7 +741,7 @@ if __name__ == "__main__":
 	infoFile = "cluster_info.dat"
 	mainScript = "cpptraj_cluster.inp"
 
-	WriteMainCpptrajScript(mainScript, args.parm, args.trajectory, stride, stripMask,
+	WriteMainCpptrajScript(mainScript, args.parm, args.trajectory_files, stride, stripMask,
 							args.protein, args.ligand, args.minpoints, args.epsilon,
 							comFile, cnumFile, summaryFile, infoFile)
 	RunCpptraj(args.cpptraj, mainScript)
@@ -649,15 +751,15 @@ if __name__ == "__main__":
 
 	referencePdb = "reference_protein.pdb"
 	refScript = "cpptraj_refpdb.inp"
-	WriteProteinReferenceCpptrajScript(refScript, args.parm, args.trajectory, args.protein, referencePdb)
+	WriteProteinReferenceCpptrajScript(refScript, args.parm, args.trajectory_files[0], args.protein, referencePdb)
 	RunCpptraj(args.cpptraj, refScript)
 
-	# Parse cpptraj outputs and the boost log
-	# ########################################
+	# Parse cpptraj outputs and the boost log(s)
+	# ###########################################
 
 	clusterIds = ParseClusterAssignments(cnumFile)
 	comCoords = ParseLigandCOM(comFile)
-	dV = ParseBoostLog(args.boost, args.dv_columns)[::stride]
+	dV = np.concatenate([ParseBoostLog(b, args.dv_columns)[::stride] for b in args.boost_files])
 
 	clusterIds, comCoords, dV = AlignFrameCounts(clusterIds, comCoords, dV)
 
