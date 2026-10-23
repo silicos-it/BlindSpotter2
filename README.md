@@ -1,24 +1,40 @@
-# BindSpotter
+# BlindSpotter
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-BindSpotter triangulates the ligand’s hotspot by turning residue-wise distance preferences into intersecting geometric constraints, yielding a precise location for the binding site.
+BlindSpotter locates the preferred binding hotspot of a ligand on a protein from a LiGaMD
+(Ligand Gaussian accelerated MD) AMBER simulation, by spatially clustering the ligand's
+trajectory and reweighting each cluster's population with the LiGaMD boost potential.
 
-## BindSpotter: From PMF to Binding Hotspot
-BindSpotter is a ```Python``` tool designed to identify the preferred binding hotspot of a ligand to a protein target from LiGaMD simulations. The workflow combines statistical reweighting, distance mapping, and geometric intersection analysis to pinpoint the most favorable ligand location.
-#### 1. LiGaMD reweighting and PMF calculation
-- For each MD frame, the distances between the ligand and every protein residue are computed.
-- Using the LiGaMD boost potential applied on ligand–protein interactions, the probability distribution along each distance axis is reweighted.
-- From these distributions, the minimum of the potential of mean force (PMF) is identified, corresponding to the distance where the ligand most prefers to reside relative to that residue.
-#### 2. Sphere representation of residue–ligand preferences
-- Each residue defines a sphere in 3D space:
-  - Center = C-alpha position of the residue.
-  - Radius = preferred ligand distance (from the PMF minimum).
-- For example, if ASP-145 shows the lowest PMF at 25 Å, the ligand’s most favorable position lies somewhere on the surface of a sphere with center at ASP-145 and radius 25 Å.
-- This procedure is repeated for all residues in the protein.
-#### 3. Geometric intersection to localize the hotspot
-- By computing the intersection of these spheres:
-  - 2 spheres intersect in a circle.
-  - 3 spheres intersect in two points.
-  - 4 or more spheres converge to a single point.
-- With many residues contributing (hundreds of spheres), their intersection collapses to a unique 3D coordinate, representing the binding hotspot where the ligand most favorably resides.
+## BlindSpotter: From Clusters to Binding Hotspot
+BlindSpotter is a ```Python``` tool that drives `cpptraj` and a boost-potential reweighting
+scheme to identify the preferred binding hotspot of a ligand on a protein target from LiGaMD
+simulations.
+
+#### 1. Trajectory preparation and ligand tracking
+- Water/ion residues are stripped (auto-detected from the topology's residue names), the
+  trajectory is RMS-fit onto the protein, and the ligand's center of mass is extracted at every
+  processed frame (`cpptraj`'s `rms`/`vector center` commands).
+- Frames are strided (automatically, or via `--stride`) so that clustering stays tractable on
+  long trajectories.
+
+#### 2. Spatial clustering of the ligand position
+- The ligand center-of-mass positions are clustered with DBSCAN (`cpptraj`'s `cluster dbscan`),
+  using `--epsilon` as the neighborhood radius and `--minpoints` as the minimum population for a
+  cluster to be considered statistically significant.
+- Each resulting cluster represents a distinct region of space the ligand occupied during the
+  simulation; its center is the mean of the ligand COM positions assigned to it.
+
+#### 3. LiGaMD reweighting and PMF per cluster
+- For each frame, the total boost potential is read from the LiGaMD log (`gamd.log`, summed
+  over `--dv-columns`).
+- Each cluster's population is reweighted with the 2nd-order cumulant-expansion method
+  (`amdweight_CE`-style correction) to turn raw frame counts into an unbiased relative free
+  energy (PMF, kcal/mol) for that cluster.
+- The cluster with the lowest PMF is reported as the predicted binding hotspot.
+
+#### 4. Output
+- A PDB file (`-o/--output`, default `hotspots.pdb`) is written containing one `HETATM` per
+  cluster center (ranked by PMF, PMF value in the B-factor column), followed by a protein
+  reference structure (first frame, protein atoms only) for visualization.
+- An optional PMF plot (`--pmf-plot`) shows PMF vs. cluster rank.
