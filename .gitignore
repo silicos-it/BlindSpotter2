@@ -2,7 +2,10 @@
 __pycache__/
 *.pyc
 
-# Large test data / simulation outputs (not suitable for git)
+# Large test data / simulation outputs (not suitable for git).
+# TestSystems/1T49/ alone is ~55GB (trajectory NPT_prod.nc is ~52GB, gamd.log
+# is ~148MB) - far beyond what git/GitHub can reasonably store. Keep these
+# files local only; see CLAUDE.md for what each one is.
 TestSystems/
 
 # Generated run artifacts (cpptraj / reweighting intermediates, local test outputs)
