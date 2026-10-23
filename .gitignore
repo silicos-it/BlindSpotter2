@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Large test data / simulation outputs (not suitable for git)
+TestSystems/
+
+# Generated run artifacts (cpptraj / reweighting intermediates, local test outputs)
+cluster_info.dat
+cluster_summary.dat
+cnumvtime.dat
+cpptraj_cluster.inp
+cpptraj_refpdb.inp
+ligand_com.dat
+reference_protein.pdb
+test.pdb
+test.png
+distances.txt
+pmf-*.txt.xvg
