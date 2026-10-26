@@ -65,4 +65,6 @@ simulations.
   cluster center (ranked by PMF, PMF value in the B-factor column, PMF standard error in the
   occupancy column), followed by a protein reference structure (first frame, protein atoms only)
   for visualization. With `--error none` the occupancy column is 1.00.
-- An optional PMF plot (`--pmf-plot`) shows PMF vs. cluster rank, with standard-error bars.
+- An optional PMF plot (`--pmf-plot`) shows the PMF of each cluster, labeled by cluster ID and
+  sorted by PMF, with the bootstrap 95% interval as (generally asymmetric) error bars. Flagged
+  clusters are drawn as open red markers with their flag letters alongside.

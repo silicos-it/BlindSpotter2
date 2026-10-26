@@ -1082,6 +1082,56 @@ def PrintErrorSummary(pmfResult, boot, flagsById, orderedIds, stride, blockSourc
 
 
 
+# Write the per-cluster PMF plot
+# ###################################
+#
+# Clusters are shown in PMF order and labeled by their cluster ID (as in the table and the
+# output PDB). Error bars span the bootstrap 95% interval, which is generally asymmetric.
+# Flagged clusters (S/C/E) are drawn as open markers with their flag letters alongside.
+
+def WritePMFPlot(plt, path, orderedIds, pmf, boot, flagsById):
+
+	x = list(range(len(orderedIds)))
+	values = [pmf[cid] for cid in orderedIds]
+
+	fig, ax = plt.subplots(figsize=(max(6.4, 0.3 * len(orderedIds)), 4.8))
+	ax.plot(x, values, "-", color="0.75", zorder=1)
+
+	if boot is not None:
+		lower = []
+		upper = []
+		for cid, v in zip(orderedIds, values):
+			lo = boot["ci_low"][cid]
+			hi = boot["ci_high"][cid]
+			lower.append(0.0 if math.isnan(lo) else max(0.0, v - lo))
+			upper.append(0.0 if math.isnan(hi) else max(0.0, hi - v))
+		ax.errorbar(x, values, yerr=[lower, upper], fmt="none", ecolor="C0", capsize=3, zorder=2,
+					label="bootstrap 95% interval")
+
+	plain = [i for i, cid in enumerate(orderedIds) if not flagsById[cid]]
+	flagged = [i for i, cid in enumerate(orderedIds) if flagsById[cid]]
+	if plain:
+		ax.plot([x[i] for i in plain], [values[i] for i in plain], "o", color="C0", zorder=3,
+				label="cluster")
+	if flagged:
+		ax.plot([x[i] for i in flagged], [values[i] for i in flagged], "o", markerfacecolor="white",
+				markeredgecolor="C3", markeredgewidth=1.5, zorder=3, label="flagged cluster (S/C/E)")
+		for i in flagged:
+			ax.annotate(flagsById[orderedIds[i]], (x[i], values[i]), textcoords="offset points",
+						xytext=(5, -3), fontsize=7, color="C3")
+
+	ax.set_xticks(x)
+	ax.set_xticklabels([str(cid) for cid in orderedIds], rotation=90 if len(orderedIds) > 20 else 0,
+					   fontsize=8 if len(orderedIds) > 20 else 10)
+	ax.set_xlabel("Cluster ID (sorted by PMF)")
+	ax.set_ylabel("PMF (kcal/mol)")
+	ax.legend(fontsize=8, loc="upper left")
+	fig.tight_layout()
+	fig.savefig(path, dpi=300)
+	plt.close(fig)
+
+
+
 # Main
 # ####
 
@@ -1284,14 +1334,5 @@ if __name__ == "__main__":
 		except Exception:
 			print("matplotlib not available - skipping PMF plot")
 		else:
-			values = [pmfResult["pmf_c2"][cid] for cid in orderedIds]
-			plt.figure()
-			if boot is not None:
-				errors = [boot["se"][cid] for cid in orderedIds]
-				plt.errorbar(range(len(values)), values, yerr=errors, fmt="o-", capsize=3)
-			else:
-				plt.plot(range(len(values)), values, "o-")
-			plt.xlabel("Cluster rank (sorted by PMF)")
-			plt.ylabel("PMF (kcal/mol)")
-			plt.savefig(args.pmf_plot, dpi=300)
+			WritePMFPlot(plt, args.pmf_plot, orderedIds, pmfResult["pmf_c2"], boot, flagsById)
 			print("Wrote PMF plot to %s" % (args.pmf_plot))
