@@ -464,6 +464,8 @@ def WriteProteinReferenceCpptrajScript(scriptPath, parmFile, trajFile, proteinMa
 	f.write("parm %s\n" % (parmFile))
 	f.write("trajin %s 1 1\n" % (trajFile))
 	f.write("strip !(%s)\n" % (proteinMask))
+	f.write("autoimage\n")
+	f.write("rms RMSFIT first %s mass\n" % (proteinMask)) 
 	f.write("trajout %s pdb\n" % (outPdb))
 	f.write("run\n")
 	f.close()
