@@ -9,12 +9,6 @@ import shutil
 import glob
 import numpy as np
 
-try:
-    import matplotlib.pyplot as plt
-    _HAVE_MATPLOTLIB = True
-except Exception:
-    _HAVE_MATPLOTLIB = False
-
 
 
 
@@ -826,7 +820,11 @@ if __name__ == "__main__":
 	# #################
 
 	if args.pmf_plot:
-		if _HAVE_MATPLOTLIB:
+		try:
+			import matplotlib.pyplot as plt
+		except Exception:
+			print("matplotlib not available - skipping PMF plot")
+		else:
 			values = [pmfResult["pmf_c2"][cid] for cid in orderedIds]
 			plt.figure()
 			plt.plot(range(len(values)), values, "o-")
@@ -834,5 +832,3 @@ if __name__ == "__main__":
 			plt.ylabel("PMF (kcal/mol)")
 			plt.savefig(args.pmf_plot, dpi=300)
 			print("Wrote PMF plot to %s" % (args.pmf_plot))
-		else:
-			print("matplotlib not available - skipping PMF plot")
