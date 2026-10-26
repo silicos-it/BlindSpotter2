@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import glob
+import subprocess
 import numpy as np
 
 
@@ -15,6 +16,13 @@ import numpy as np
 VERSION = "2.0"
 CPPTRAJ = "/usr/local/amber24/bin/cpptraj"  # last-resort fallback if nothing better is found
 KB = 0.001987  # Boltzmann constant, kcal/mol/K
+
+# Heuristic thresholds for flagging clusters whose cumulant-expansion PMF may be unreliable
+SIGMA_DV_MAX = 6.0       # kcal/mol; 2nd-order cumulant expansion is accurate below roughly this dV spread
+C3_TERM_MAX = 0.5        # kcal/mol; neglected 3rd-order cumulant term, relative to the reference cluster
+EMPTY_FRACTION_MAX = 0.05  # fraction of bootstrap resamples in which a cluster may be empty
+MIN_BOOTSTRAP_BLOCKS = 20  # auto block size is capped so at least this many blocks remain
+MINOR_CLUSTER_FRACTION = 0.01  # clusters below this fraction of frames are "minor" in the error summary
 
 # Canonical AMBER water/ion residue names. Deliberately excludes ambiguous
 # bare-element tokens (e.g. plain "CA") that could collide with a real residue.
@@ -254,6 +262,34 @@ def ParseCommandline():
 						required=False,
 						default=None)
 
+	parser.add_argument("--error",
+						type=str,
+						choices=["block", "none"],
+						help="PMF error estimation: 'block' = moving-block bootstrap over the concatenated "
+							 "frame series, 'none' = skip error estimation",
+						required=False,
+						default="block")
+
+	parser.add_argument("--nboot",
+						type=int,
+						help="number of bootstrap resamples used for the PMF error estimate",
+						required=False,
+						default=200)
+
+	parser.add_argument("--block-frames",
+						dest="block_frames",
+						type=int,
+						help="bootstrap block length in processed (post-stride) frames "
+							 "(0 = auto, derived from block averaging of the per-frame signals)",
+						required=False,
+						default=0)
+
+	parser.add_argument("--seed",
+						type=int,
+						help="random seed for the bootstrap (default: non-reproducible)",
+						required=False,
+						default=None)
+
 	parser.add_argument("--cpptraj",
 						type=str,
 						help="path to the cpptraj executable (default: auto-detected from $AMBERHOME, "
@@ -311,6 +347,12 @@ def ParseCommandline():
 		sys.exit(1)
 	if args.max_cluster_frames < 1:
 		print("--max-cluster-frames should be >= 1 - quitting with error code 1")
+		sys.exit(1)
+	if args.nboot < 10:
+		print("--nboot should be >= 10 - quitting with error code 1")
+		sys.exit(1)
+	if args.block_frames < 0:
+		print("--block-frames should be >= 0 - quitting with error code 1")
 		sys.exit(1)
 
 	# --dv-columns
@@ -424,6 +466,37 @@ def RunCpptraj(cpptrajExe, scriptPath):
 	if rc != 0:
 		print("cpptraj failed (return code %d) while running %s - quitting with error code 1" % (rc, scriptPath))
 		sys.exit(1)
+
+
+
+# Count the frames cpptraj will read from each trajectory file
+# ################################################################
+#
+# Uses cpptraj's "list trajin", which reports "(reading N of M)" per trajectory
+# without loading any coordinates. Returns a list of per-file frame counts (after
+# striding), or None if cpptraj's output could not be parsed.
+
+def CountTrajectoryFrames(cpptrajExe, scriptPath, parmFile, trajFiles, stride):
+
+	f = open(scriptPath, "w")
+	f.write("parm %s\n" % (parmFile))
+	for trajFile in trajFiles:
+		f.write("trajin %s 1 last %d\n" % (trajFile, stride))
+	f.write("list trajin\n")
+	f.write("quit\n")
+	f.close()
+
+	try:
+		result = subprocess.run([cpptrajExe, "-i", scriptPath], stdout=subprocess.PIPE,
+								stderr=subprocess.STDOUT, universal_newlines=True)
+	except OSError:
+		return None
+	if result.returncode != 0:
+		return None
+	counts = [int(m.group(1)) for m in re.finditer(r"\(reading\s+(\d+)\s+of\s+\d+\)", result.stdout)]
+	if len(counts) != len(trajFiles):
+		return None
+	return counts
 
 
 
@@ -550,6 +623,41 @@ def AlignFrameCounts(*arrays):
 
 
 
+# Align the cpptraj per-frame output with the per-run boost logs, run by run
+# ##############################################################################
+#
+# cpptraj processes all trajectories as one concatenated series. If a trajectory and its
+# boost log disagree in length, truncating only the tail of the concatenated arrays would
+# pair every later frame with the wrong dV. Instead, each run is truncated to the shorter
+# of its trajectory/boost-log frame counts before concatenation. Falls back to tail
+# truncation (with a warning) if the per-trajectory frame counts are unknown or
+# inconsistent with the cpptraj output.
+
+def AlignRunFrames(clusterIds, comCoords, dVRuns, trajCounts):
+
+	nCpptraj = (clusterIds.shape[0], comCoords.shape[0])
+	if trajCounts is None or nCpptraj[0] != sum(trajCounts) or nCpptraj[1] != sum(trajCounts):
+		print("Warning: could not determine per-trajectory frame counts consistent with the cpptraj "
+			  "output %s - falling back to tail truncation; frames may be mispaired with dV if any "
+			  "trajectory/boost log pair other than the last differs in length" % (list(nCpptraj),))
+		return AlignFrameCounts(clusterIds, comCoords, np.concatenate(dVRuns))
+
+	keep = []
+	dVParts = []
+	offset = 0
+	for i, (nTraj, dVi) in enumerate(zip(trajCounts, dVRuns), start=1):
+		n = min(nTraj, dVi.shape[0])
+		if nTraj != dVi.shape[0]:
+			print("Warning: run [%d] has %d trajectory frames but %d boost-log frames (after stride) - "
+				  "using the first %d of both" % (i, nTraj, dVi.shape[0], n))
+		keep.append(np.arange(offset, offset + n))
+		dVParts.append(dVi[:n])
+		offset += nTraj
+	keep = np.concatenate(keep)
+	return clusterIds[keep], comCoords[keep], np.concatenate(dVParts)
+
+
+
 # Effective acceleration factor (Gaussian approximation)
 # ###########################################################
 
@@ -627,6 +735,163 @@ def ComputeClusterPMF(clusterIds, dV, T, cbMax):
 
 
 
+# Per-cluster diagnostics on the validity of the 2nd-order cumulant expansion
+# ###############################################################################
+#
+# The 2nd-order cumulant expansion is exact only for a Gaussian dV distribution. Reported
+# per cluster: skewness and excess kurtosis of dV, and the neglected 3rd-order cumulant
+# contribution to the PMF, -beta^2 * kappa3 / 6 (kcal/mol). Since only PMF differences are
+# meaningful, the truncation error of a cluster's relative PMF is the difference of this
+# term with that of the reference cluster (a dV skew shared by all clusters cancels). The
+# term is itself a noisy estimate, but gives the order of magnitude of the truncation error.
+
+def ComputeDVDiagnostics(clusterIds, dV, T, clusters):
+
+	beta = 1.0 / (KB * T)
+	diag = {}
+	for cid in clusters:
+		dVj = dV[clusterIds == cid]
+		d = dVj - np.mean(dVj)
+		var = float(np.mean(d ** 2))
+		kappa3 = float(np.mean(d ** 3))
+		kappa4 = float(np.mean(d ** 4)) - 3.0 * var ** 2
+		if var > 0:
+			skew = kappa3 / var ** 1.5
+			kurt = kappa4 / var ** 2
+		else:
+			skew = 0.0
+			kurt = 0.0
+		diag[cid] = {
+			"skew": skew,
+			"kurt": kurt,
+			"c3_term": -beta ** 2 * kappa3 / 6.0,
+		}
+	return diag
+
+
+
+# Auto-derive the bootstrap block length by block averaging (Flyvbjerg-Petersen)
+# ###################################################################################
+#
+# For each per-frame signal (dV, and the membership indicator of each cluster), the
+# statistical inefficiency g(B) = B * var(block means) / var(x) is computed for block
+# lengths B = 1, 2, 4, ... while at least MIN_BOOTSTRAP_BLOCKS blocks remain. g(B) rises
+# with B until the blocks are longer than the correlation time, then plateaus; the block
+# length for a signal is the smallest B reaching 90% of its largest g(B). The returned
+# block length is the largest over all signals.
+
+def EstimateBlockFrames(clusterIds, dV, clusters):
+
+	n = clusterIds.shape[0]
+	signals = [dV] + [(clusterIds == cid).astype(float) for cid in clusters]
+	blockFrames = 1
+	for x in signals:
+		var = float(np.var(x))
+		if var <= 0:
+			continue
+		sizes = []
+		gs = []
+		B = 1
+		while n // B >= MIN_BOOTSTRAP_BLOCKS:
+			nb = n // B
+			means = x[:nb * B].reshape(nb, B).mean(axis=1)
+			sizes.append(B)
+			gs.append(B * float(np.var(means)) / var)
+			B *= 2
+		if not gs:
+			continue
+		gMax = max(gs)
+		for B, g in zip(sizes, gs):
+			if g >= 0.9 * gMax:
+				blockFrames = max(blockFrames, B)
+				break
+	return blockFrames
+
+
+
+# Moving-block bootstrap estimate of the per-cluster PMF error
+# ##################################################################
+#
+# The concatenated frame series is resampled as ceil(n/B) overlapping blocks of B
+# consecutive frames, drawn with replacement. For each resample the cumulant-expansion
+# PMF of every cluster is recomputed (same formula as ComputeClusterPMF) and expressed
+# relative to a fixed reference cluster (the full-data PMF minimum), so the reported
+# errors are on the same zero point as the reported PMFs. Per-block sufficient statistics
+# (count, sum dV, sum dV^2 per cluster) come from cumulative sums, so each resample costs
+# only O(n/B * nClusters).
+#
+# Returns per cluster: standard error, 2.5/97.5 percentiles, the fraction of resamples in
+# which the cluster has the lowest PMF, the number of resamples in which it was empty, and
+# the standard error of the 3rd-order cumulant term relative to the reference cluster (see
+# ComputeDVDiagnostics), needed to tell a real difference in non-Gaussianity apart from noise.
+
+def BlockBootstrapPMF(clusterIds, dV, T, clusters, refCluster, blockFrames, nBoot, seed):
+
+	beta = 1.0 / (KB * T)
+	kT = KB * T
+	n = clusterIds.shape[0]
+	K = len(clusters)
+	B = max(1, min(blockFrames, n))
+	nBlocks = int(math.ceil(n / float(B)))
+	ref = clusters.index(refCluster)
+
+	member = np.zeros((n, K))
+	for k, cid in enumerate(clusters):
+		member[:, k] = (clusterIds == cid)
+	csN = np.vstack([np.zeros(K), np.cumsum(member, axis=0)])
+	csS1 = np.vstack([np.zeros(K), np.cumsum(member * dV[:, None], axis=0)])
+	csS2 = np.vstack([np.zeros(K), np.cumsum(member * (dV ** 2)[:, None], axis=0)])
+	csS3 = np.vstack([np.zeros(K), np.cumsum(member * (dV ** 3)[:, None], axis=0)])
+
+	rng = np.random.default_rng(seed)
+	samples = np.full((nBoot, K), np.nan)
+	c3Samples = np.full((nBoot, K), np.nan)
+	isLowest = np.zeros(K)
+	nEmpty = np.zeros(K, dtype=int)
+	for i in range(nBoot):
+		starts = rng.integers(0, n - B + 1, size=nBlocks)
+		N = (csN[starts + B] - csN[starts]).sum(axis=0)
+		S1 = (csS1[starts + B] - csS1[starts]).sum(axis=0)
+		S2 = (csS2[starts + B] - csS2[starts]).sum(axis=0)
+		S3 = (csS3[starts + B] - csS3[starts]).sum(axis=0)
+		present = N > 0
+		nEmpty += ~present
+		avg = np.where(present, S1 / np.maximum(N, 1), 0.0)
+		avg2 = np.where(present, S2 / np.maximum(N, 1), 0.0)
+		avg3 = np.where(present, S3 / np.maximum(N, 1), 0.0)
+		var = avg2 - avg ** 2
+		kappa3 = avg3 - 3.0 * avg * avg2 + 2.0 * avg ** 3
+		if present[ref]:
+			c3 = -beta ** 2 * kappa3 / 6.0
+			c3Samples[i, present] = c3[present] - c3[ref]
+		pmf = np.full(K, np.inf)
+		pmf[present] = -kT * np.log(N[present]) - avg[present] - 0.5 * beta * var[present]
+		isLowest[int(np.argmin(pmf))] += 1
+		if present[ref]:
+			samples[i, present] = pmf[present] - pmf[ref]
+
+	result = {"block_frames": B, "n_boot": nBoot, "se": {}, "ci_low": {}, "ci_high": {},
+			  "p_lowest": {}, "n_empty": {}, "c3_se": {}}
+	for k, cid in enumerate(clusters):
+		s = samples[:, k]
+		s = s[~np.isnan(s)]
+		if s.shape[0] >= 2:
+			result["se"][cid] = float(np.std(s, ddof=1))
+			result["ci_low"][cid] = float(np.percentile(s, 2.5))
+			result["ci_high"][cid] = float(np.percentile(s, 97.5))
+		else:
+			result["se"][cid] = float("nan")
+			result["ci_low"][cid] = float("nan")
+			result["ci_high"][cid] = float("nan")
+		c3 = c3Samples[:, k]
+		c3 = c3[~np.isnan(c3)]
+		result["c3_se"][cid] = float(np.std(c3, ddof=1)) if c3.shape[0] >= 2 else float("nan")
+		result["p_lowest"][cid] = isLowest[k] / float(nBoot)
+		result["n_empty"][cid] = int(nEmpty[k])
+	return result
+
+
+
 # Compute the Cartesian center of each cluster (mean ligand COM)
 # ####################################################################
 
@@ -658,10 +923,11 @@ def ParseClusterInfoStats(path):
 
 
 
-# Write the output PDB: cluster centers (PMF in the B-factor column) + protein reference
+# Write the output PDB: cluster centers (PMF in the B-factor column, its bootstrap
+# standard error - if available - in the occupancy column) + protein reference
 # ############################################################################################
 
-def WriteOutputPDB(outFile, centers, pmf, referencePdb):
+def WriteOutputPDB(outFile, centers, pmf, referencePdb, pmfSE=None):
 
 	fo = open(outFile, "w")
 
@@ -670,8 +936,11 @@ def WriteOutputPDB(outFile, centers, pmf, referencePdb):
 	for cid in orderedIds:
 		serial += 1
 		x, y, z = centers[cid]
+		occupancy = 1.00
+		if pmfSE is not None and not math.isnan(pmfSE[cid]):
+			occupancy = pmfSE[cid]
 		fo.write("%-6s%5d %-4s%1s%-3s %1s%4d%1s   %8.3f%8.3f%8.3f%6.2f%6.2f\n" %
-				 ("HETATM", serial, "CA", " ", "HOT", "X", cid, " ", x, y, z, 1.00, pmf[cid]))
+				 ("HETATM", serial, "CA", " ", "HOT", "X", cid, " ", x, y, z, occupancy, pmf[cid]))
 	fo.write("TER\n")
 
 	if os.path.exists(referencePdb):
@@ -687,6 +956,129 @@ def WriteOutputPDB(outFile, centers, pmf, referencePdb):
 
 	fo.write("END\n")
 	fo.close()
+
+
+
+# Print a plain-language summary of the PMF error estimate and the reweighting diagnostics
+# ##############################################################################################
+#
+# Always printed. Covers: the time correlation (block length and effective number of
+# independent pieces of data), the predicted hotspot versus the runner-up, the
+# undersampled minor clusters, and the S/C flags on the cumulant-expansion validity.
+# Parts that need the bootstrap are replaced by a note when --error is 'none'.
+
+def PrintErrorSummary(pmfResult, boot, flagsById, orderedIds, stride, blockSource):
+
+	nProcessed = pmfResult["n_total"]
+	frac = dict((cid, pmfResult["population"][cid] / float(nProcessed)) for cid in orderedIds)
+	best = orderedIds[0]
+
+	print("")
+	print("Error summary")
+	print("-------------")
+
+	if boot is None:
+		print("- PMF error estimation was disabled (--error none): no correlation, hotspot-confidence "
+			  "or undersampling assessment is available.")
+	else:
+		# Time correlation
+		B = boot["block_frames"]
+		nPieces = nProcessed / float(B)
+		label = "automatic" if blockSource.startswith("auto") else "user-specified"
+		if B == 1:
+			print("- No time correlation detected. The %s block length is 1 processed frame (%d MD frames), "
+				  "so all %d processed frames count as independent data." % (label, stride, nProcessed))
+		else:
+			if nPieces < 100:
+				heading = "Long correlation"
+				meaning = ("The ligand stays in one region for long stretches, so there are effectively "
+						   "only about %d independent pieces of data." % (round(nPieces)))
+			else:
+				heading = "Time correlation"
+				meaning = ("There are effectively about %d independent pieces of data." % (round(nPieces)))
+			print("- %s. The %s block length is %d processed frames, which is %d MD frames. %s" %
+				  (heading, label, B, B * stride, meaning))
+
+		# Hotspot versus runner-up
+		if len(orderedIds) < 2:
+			print("- Hotspot vs runner-up: only one cluster was found (cluster %d), so there is no "
+				  "runner-up to compare with." % (best))
+		else:
+			second = orderedIds[1]
+			gap = pmfResult["pmf_c2"][second]
+			se = boot["se"][second]
+			colA = "Cluster %d (predicted hotspot)" % (best)
+			colB = "Cluster %d (runner-up)" % (second)
+			rows = [
+				("Share of frames", "%.0f%%" % (100.0 * frac[best]), "%.0f%%" % (100.0 * frac[second])),
+				("Lowest in % of resamples", "%.0f%%" % (100.0 * boot["p_lowest"][best]),
+				 "%.0f%%" % (100.0 * boot["p_lowest"][second])),
+				("PMF gap to cluster %d" % (best), "-", "%.2f +/- %.2f kcal/mol" % (gap, se)),
+			]
+			w0 = max(len(r[0]) for r in rows)
+			w1 = max([len(colA)] + [len(r[1]) for r in rows])
+			w2 = max([len(colB)] + [len(r[2]) for r in rows])
+			print("- Hotspot vs runner-up:")
+			print("")
+			print("  | %-*s | %-*s | %-*s |" % (w0, "", w1, colA, w2, colB))
+			print("  |%s|%s|%s|" % ("-" * (w0 + 2), "-" * (w1 + 2), "-" * (w2 + 2)))
+			for r in rows:
+				print("  | %-*s | %-*s | %-*s |" % (w0, r[0], w1, r[1], w2, r[2]))
+			print("")
+			if math.isnan(se):
+				print("  The error of the gap could not be estimated (the runner-up is too often absent "
+					  "from the resamples).")
+			elif gap > 2.0 * se:
+				print("  The gap exceeds 2x its error, so the hotspot ranking is statistically robust.")
+			elif gap > se:
+				print("  The hotspot is favoured, but the gap is less than 2x its error, so the ranking "
+					  "is not fully certain.")
+			else:
+				print("  Within the error, the ranking of these two is uncertain.")
+
+		# Minor clusters
+		minor = [cid for cid in orderedIds if frac[cid] < MINOR_CLUSTER_FRACTION]
+		if not minor:
+			print("- Minor clusters. No cluster is below %.0f%% of frames." % (100.0 * MINOR_CLUSTER_FRACTION))
+		else:
+			minorE = [cid for cid in minor if "E" in flagsById[cid]]
+			ses = [boot["se"][cid] for cid in minor if not math.isnan(boot["se"][cid])]
+			text = ("- Minor clusters. %d of the %d cluster%s below %.0f%% of frames get the E flag" %
+					(len(minorE), len(minor), "s" if len(minor) > 1 else "", 100.0 * MINOR_CLUSTER_FRACTION))
+			if minorE:
+				text += ": they come from only a few visits"
+			if len(ses) == 1 or (ses and "%.1f" % min(ses) == "%.1f" % max(ses)):
+				text += "; their PMF SE is %.1f kcal/mol" % (ses[0])
+			elif ses:
+				text += "; their PMF SEs are %.1f-%.1f kcal/mol" % (min(ses), max(ses))
+			print(text + ".")
+		majorE = [cid for cid in orderedIds if frac[cid] >= MINOR_CLUSTER_FRACTION and "E" in flagsById[cid]]
+		if majorE:
+			print("  Larger clusters with the E flag: %s." % (", ".join(str(c) for c in majorE)))
+
+	# Cumulant-expansion validity (S and C flags)
+	sigmas = [pmfResult["dV_std"][cid] for cid in orderedIds]
+	sClusters = [cid for cid in orderedIds if "S" in flagsById[cid]]
+	cClusters = [cid for cid in orderedIds if "C" in flagsById[cid]]
+	cQualifier = "significant " if boot is not None else ""
+	if not sClusters:
+		text = ("- No S flags. sigma_dV is about %.1f kcal/mol (range %.1f-%.1f), so the 2nd-order expansion "
+				"is not in trouble because of dV spread." % (float(np.median(sigmas)), min(sigmas), max(sigmas)))
+	else:
+		text = ("- S flags on cluster(s) %s: sigma_dV exceeds %.1f kcal/mol there, so their 2nd-order PMFs "
+				"may be inaccurate." % (", ".join(str(c) for c in sClusters), SIGMA_DV_MAX))
+	if not cClusters:
+		text += " There are also no %sC flags." % (cQualifier)
+	else:
+		text += (" %sC flags on cluster(s) %s: their dV distribution differs in non-Gaussianity from the "
+				 "hotspot's, so their relative PMFs may carry a 3rd-order truncation error." %
+				 (cQualifier.capitalize(), ", ".join(str(c) for c in cClusters)))
+		if len(orderedIds) > 1 and orderedIds[1] in cClusters:
+			text += " This includes the runner-up, which affects the hotspot ranking."
+		if boot is None:
+			text += (" Without the bootstrap these flags are not tested for significance, and the 3rd-order "
+					 "estimate is noisy, so many may be false alarms.")
+	print(text)
 
 
 
@@ -734,6 +1126,12 @@ if __name__ == "__main__":
 	print("Boost log(s) report %d frames total; using stride %d (~%d frames to be processed)" %
 		  (nFramesTotal, stride, (nFramesTotal + stride - 1) // stride))
 
+	# Per-trajectory frame counts (for run-by-run alignment with the boost logs)
+	# ##########################################################################
+
+	countScript = "cpptraj_count.inp"
+	trajCounts = CountTrajectoryFrames(args.cpptraj, countScript, args.parm, args.trajectory_files, stride)
+
 	# Main cpptraj analysis: strip, align, ligand COM, cluster
 	# #########################################################
 
@@ -761,9 +1159,9 @@ if __name__ == "__main__":
 
 	clusterIds = ParseClusterAssignments(cnumFile)
 	comCoords = ParseLigandCOM(comFile)
-	dV = np.concatenate([ParseBoostLog(b, args.dv_columns)[::stride] for b in args.boost_files])
+	dVRuns = [ParseBoostLog(b, args.dv_columns)[::stride] for b in args.boost_files]
 
-	clusterIds, comCoords, dV = AlignFrameCounts(clusterIds, comCoords, dV)
+	clusterIds, comCoords, dV = AlignRunFrames(clusterIds, comCoords, dVRuns, trajCounts)
 
 	# Reweighting
 	# ###########
@@ -792,29 +1190,90 @@ if __name__ == "__main__":
 	else:
 		print("Could not parse DBI/pSF/SSR-SST from %s (format not recognized) - see file directly." % (infoFile))
 
-	print("")
-	print("%6s %10s %8s %10s %10s %10s %30s" % ("Cluster", "Population", "Frac(%)", "dV_avg", "dV_std", "PMF", "Center (x,y,z)"))
 	orderedIds = sorted(clusters, key=lambda cid: pmfResult["pmf_c2"][cid])
+	best = orderedIds[0]
+
+	# Error estimation and cumulant-expansion diagnostics
+	# ####################################################
+
+	diag = ComputeDVDiagnostics(clusterIds, dV, args.temperature, clusters)
+
+	boot = None
+	if args.error == "block":
+		if args.block_frames > 0:
+			blockFrames = args.block_frames
+			blockSource = "user-specified"
+		else:
+			blockFrames = EstimateBlockFrames(clusterIds, dV, clusters)
+			blockSource = "auto, block averaging"
+		boot = BlockBootstrapPMF(clusterIds, dV, args.temperature, clusters, best,
+								 blockFrames, args.nboot, args.seed)
+		print("PMF error estimate     : moving-block bootstrap, %d resamples, block length %d frames (%s)" %
+			  (boot["n_boot"], boot["block_frames"], blockSource))
+
+	print("")
+	print("%6s %10s %8s %10s %10s %10s %8s %17s %8s %7s %7s %7s %5s %30s" %
+		  ("Cluster", "Population", "Frac(%)", "dV_avg", "dV_std", "PMF", "PMF_SE", "PMF_95%CI", "P(low)",
+		   "Skew", "ExKurt", "dC3", "Flags", "Center (x,y,z)"))
+	flagsById = {}
 	for cid in orderedIds:
 		pop = pmfResult["population"][cid]
 		frac = 100.0 * pop / nProcessed
 		x, y, z = centers[cid]
-		print("%6d %10d %8.2f %10.4f %10.4f %10.4f %10.3f%10.3f%10.3f" %
-			  (cid, pop, frac, pmfResult["dV_avg"][cid], pmfResult["dV_std"][cid], pmfResult["pmf_c2"][cid], x, y, z))
+		flags = ""
+		if pmfResult["dV_std"][cid] > SIGMA_DV_MAX:
+			flags += "S"
+		dC3 = diag[cid]["c3_term"] - diag[best]["c3_term"]
+		if abs(dC3) > C3_TERM_MAX:
+			# With a bootstrap available, only flag a 3rd-order term that is clearly non-zero
+			if boot is None or not (abs(dC3) <= 2.0 * boot["c3_se"][cid]):
+				flags += "C"
+		if boot is not None:
+			ci = "[%7.3f,%7.3f]" % (boot["ci_low"][cid], boot["ci_high"][cid])
+			if boot["n_empty"][cid] > EMPTY_FRACTION_MAX * boot["n_boot"]:
+				flags += "E"
+			errCols = "%8.4f %17s %8.3f" % (boot["se"][cid], ci, boot["p_lowest"][cid])
+		else:
+			errCols = "%8s %17s %8s" % ("-", "-", "-")
+		flagsById[cid] = flags
+		print("%6d %10d %8.2f %10.4f %10.4f %10.4f %s %7.3f %7.3f %7.3f %5s %10.3f%10.3f%10.3f" %
+			  (cid, pop, frac, pmfResult["dV_avg"][cid], pmfResult["dV_std"][cid], pmfResult["pmf_c2"][cid],
+			   errCols, diag[cid]["skew"], diag[cid]["kurt"], dC3, flags or "-", x, y, z))
+	print("")
+	print("PMF_SE/PMF_95%CI are relative to the lowest-PMF cluster (whose error is therefore 0); "
+		  "P(low) is the fraction of bootstrap resamples in which the cluster has the lowest PMF; "
+		  "dC3 is the neglected 3rd-order cumulant PMF term (kcal/mol), relative to the lowest-PMF cluster.")
+	print("Flags: S = dV_std > %.1f kcal/mol, C = |dC3| > %.2f kcal/mol "
+		  "%s(2nd-order cumulant expansion may be inaccurate), E = cluster empty in > %.0f%% of resamples "
+		  "(undersampled)." % (SIGMA_DV_MAX, C3_TERM_MAX,
+							"and > 2x its bootstrap SE " if boot is not None else "",
+							100.0 * EMPTY_FRACTION_MAX))
 
-	best = orderedIds[0]
 	print("")
 	print("Predicted binding hotspot: cluster %d" % (best))
 	print("  Population : %d (%.2f%%)" % (pmfResult["population"][best], 100.0 * pmfResult["population"][best] / nProcessed))
 	print("  PMF        : %.4f kcal/mol" % (pmfResult["pmf_c2"][best]))
+	if boot is not None:
+		print("  P(lowest)  : %.3f" % (boot["p_lowest"][best]))
+		if len(orderedIds) > 1:
+			second = orderedIds[1]
+			print("  Gap to next: %.4f +/- %.4f kcal/mol (cluster %d)" %
+				  (pmfResult["pmf_c2"][second], boot["se"][second], second))
 	print("  Center     : [%.3f, %.3f, %.3f]" % tuple(centers[best]))
+
+	PrintErrorSummary(pmfResult, boot, flagsById, orderedIds, stride, blockSource if boot is not None else None)
 
 	# Output PDB
 	# ##########
 
-	WriteOutputPDB(args.output, centers, pmfResult["pmf_c2"], referencePdb)
+	WriteOutputPDB(args.output, centers, pmfResult["pmf_c2"], referencePdb,
+				   boot["se"] if boot is not None else None)
 	print("")
-	print("Wrote cluster centers (PMF in the B-factor column) and the protein reference to %s" % (args.output))
+	if boot is not None:
+		print("Wrote cluster centers (PMF in the B-factor column, PMF standard error in the occupancy column) "
+			  "and the protein reference to %s" % (args.output))
+	else:
+		print("Wrote cluster centers (PMF in the B-factor column) and the protein reference to %s" % (args.output))
 
 	# Optional PMF plot
 	# #################
@@ -827,7 +1286,11 @@ if __name__ == "__main__":
 		else:
 			values = [pmfResult["pmf_c2"][cid] for cid in orderedIds]
 			plt.figure()
-			plt.plot(range(len(values)), values, "o-")
+			if boot is not None:
+				errors = [boot["se"][cid] for cid in orderedIds]
+				plt.errorbar(range(len(values)), values, yerr=errors, fmt="o-", capsize=3)
+			else:
+				plt.plot(range(len(values)), values, "o-")
 			plt.xlabel("Cluster rank (sorted by PMF)")
 			plt.ylabel("PMF (kcal/mol)")
 			plt.savefig(args.pmf_plot, dpi=300)
